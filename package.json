@@ -1,11 +1,33 @@
 {
   "name": "mcrm-mini",
   "version": "1.0.0",
+  "description": "Minimal Invite Server for Multi-Session CRM (Resend + JWT + Express)",
   "type": "module",
-  "scripts": { "start": "node server.js" },
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
   "dependencies": {
     "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
     "express": "^4.19.2",
-    "helmet": "^7.1.0"
-  }
+    "helmet": "^7.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "nanoid": "^4.0.2",
+    "undici": "^6.19.8"
+  },
+  "engines": {
+    "node": ">=18.x"
+  },
+  "keywords": [
+    "express",
+    "api",
+    "invite",
+    "resend",
+    "crm",
+    "jwt",
+    "multi-session"
+  ],
+  "author": "4PM Digitalz LLC",
+  "license": "MIT"
 }
