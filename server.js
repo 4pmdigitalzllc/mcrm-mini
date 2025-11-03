@@ -1,356 +1,289 @@
-// server.js
-// mcrm-mini: Invite-Mail-Versand (Resend) + PostgreSQL-Persistenz (auto schema)
-// Requires: npm i express cors pg resend nanoid
+// server.js — mcrm-mini (Invite API + Email via Resend, Postgres persistence)
+// Node 18+ recommended
 
 import express from 'express';
 import cors from 'cors';
 import crypto from 'crypto';
 import { Resend } from 'resend';
-import { nanoid } from 'nanoid';
 import pkg from 'pg';
+
 const { Pool } = pkg;
 
-/* ===== ENV ===== */
+/* ====== ENV ====== */
 const {
-  PORT = 3000,
+  PORT = 10000,
   NODE_ENV = 'production',
-  DATABASE_URL,
+  BASE_URL,                 // e.g. https://mcrm-mini.onrender.com
+  ALLOWED_ORIGINS = '',
   RESEND_API_KEY,
-  INVITE_SIGNING_SECRET,
   EMAIL_FROM,
   EMAIL_REPLY_TO,
-  ACCEPT_BASE_URL,        // e.g. https://app.multi-session-crm.com/accept
-  DOWNLOAD_BASE_URL,      // e.g. https://app.multi-session-crm.com/download
-  APP_DEEPLINK_SCHEME,    // e.g. mcrm://
-  ALLOWED_ORIGINS = ''
+  ACCEPT_BASE_URL,          // e.g. https://invite.multi-session-crm.com/accept
+  DOWNLOAD_BASE_URL,        // e.g. https://invite.multi-session-crm.com/download
+  INVITE_SIGNING_SECRET,    // long random string
+  DATABASE_URL,
+  RATE_LIMIT_MAX = '30',
+  RATE_LIMIT_WINDOW = '60000'
 } = process.env;
 
-if (!DATABASE_URL) throw new Error('DATABASE_URL missing');
-if (!RESEND_API_KEY) throw new Error('RESEND_API_KEY missing');
-if (!INVITE_SIGNING_SECRET) throw new Error('INVITE_SIGNING_SECRET missing');
-if (!EMAIL_FROM) throw new Error('EMAIL_FROM missing');
-if (!ACCEPT_BASE_URL) throw new Error('ACCEPT_BASE_URL missing');
-if (!DOWNLOAD_BASE_URL) throw new Error('DOWNLOAD_BASE_URL missing');
+/* ====== Guards ====== */
+function must(val, name) {
+  if (!val || String(val).trim() === '') {
+    console.error(`[ENV MISSING] ${name}`);
+    process.exit(1);
+  }
+}
+must(RESEND_API_KEY, 'RESEND_API_KEY');
+must(EMAIL_FROM, 'EMAIL_FROM');
+must(ACCEPT_BASE_URL, 'ACCEPT_BASE_URL');
+must(DOWNLOAD_BASE_URL, 'DOWNLOAD_BASE_URL');
+must(INVITE_SIGNING_SECRET, 'INVITE_SIGNING_SECRET');
+must(DATABASE_URL, 'DATABASE_URL');
 
-const resend = new Resend(RESEND_API_KEY);
-const pool = new Pool({ connectionString: DATABASE_URL });
-
-/* ===== App ===== */
+/* ====== Core ====== */
 const app = express();
-app.use(express.json());
-app.use(express.urlencoded({ extended: false }));
+app.use(express.json({ limit: '1mb' }));
 
-/* ===== CORS ===== */
-const allowList = ALLOWED_ORIGINS
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
+/* CORS */
+const allow = new Set(
+  ALLOWED_ORIGINS
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean)
+);
 app.use(cors({
   origin: (origin, cb) => {
-    if (!origin) return cb(null, true);
-    if (allowList.length === 0) return cb(null, true);
-    return cb(null, allowList.includes(origin));
+    if (!origin) return cb(null, true); // allow curl/postman
+    if (allow.has(origin)) return cb(null, true);
+    return cb(new Error('Not allowed by CORS: ' + origin));
   },
-  credentials: false
+  credentials: false,
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  methods: ['GET','POST','OPTIONS']
 }));
 
-/* ===== Helpers ===== */
-function nowIso() { return new Date().toISOString(); }
-function sha256Base64url(input) {
-  return crypto.createHmac('sha256', INVITE_SIGNING_SECRET)
-    .update(input)
-    .digest('base64url');
-}
-function makeToken() {
-  // opaque token -> not guessable
-  return nanoid(48); // ~288 bits
-}
-function acceptUrlFromToken(token) {
-  const url = new URL(ACCEPT_BASE_URL);
-  url.searchParams.set('token', token);
-  return url.toString();
-}
-function downloadUrl() {
-  return DOWNLOAD_BASE_URL;
-}
-function appDeepLink(inviteId) {
-  if (!APP_DEEPLINK_SCHEME) return null;
-  // Example: mcrm://accept?inviteId=...
-  return `${APP_DEEPLINK_SCHEME.replace(/:$/, '')}://accept?inviteId=${encodeURIComponent(inviteId)}`;
+/* Basic rate limit (in-memory) */
+const maxReq = parseInt(RATE_LIMIT_MAX, 10) || 30;
+const winMs = parseInt(RATE_LIMIT_WINDOW, 10) || 60000;
+const ipHits = new Map();
+app.use((req, res, next) => {
+  const now = Date.now();
+  const w = ipHits.get(req.ip) || [];
+  const fresh = w.filter(t => now - t < winMs);
+  fresh.push(now);
+  ipHits.set(req.ip, fresh);
+  if (fresh.length > maxReq) return res.status(429).json({ ok:false, error:'rate_limited' });
+  next();
+});
+
+/* Postgres */
+const pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
+
+async function ensureSchema() {
+  // idempotent – falls du mal „nackt“ startest
+  const sql = `
+    create extension if not exists pgcrypto;
+    create table if not exists invites (
+      id uuid primary key default gen_random_uuid(),
+      workspace_id text not null,
+      inviter_email text not null,
+      invitee_email text not null,
+      role text not null check (role in ('member','admin')),
+      status text not null default 'pending' check (status in ('pending','accepted','cancelled')),
+      token text not null unique,
+      created_at timestamptz not null default now(),
+      accepted_at timestamptz
+    );
+    create index if not exists idx_invites_invitee on invites (invitee_email);
+    create index if not exists idx_invites_token on invites (token);
+  `;
+  await pool.query(sql);
 }
 
-/* ===== DB: init schema ===== */
-const SQL_INIT = `
-CREATE TABLE IF NOT EXISTS invites (
-  id               TEXT PRIMARY KEY,
-  workspace_id     TEXT NOT NULL,
-  email            TEXT NOT NULL,
-  role             TEXT NOT NULL CHECK (role IN ('member','admin')),
-  token_hash       TEXT NOT NULL,
-  status           TEXT NOT NULL CHECK (status IN ('pending','accepted','cancelled')) DEFAULT 'pending',
-  invited_by       TEXT NOT NULL,
-  created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  expires_at       TIMESTAMPTZ NOT NULL,
-  accepted_at      TIMESTAMPTZ,
-  last_sent_at     TIMESTAMPTZ,
-  UNIQUE (workspace_id, email, status) WHERE status = 'pending'
-);
-CREATE INDEX IF NOT EXISTS idx_invites_workspace ON invites (workspace_id);
-CREATE INDEX IF NOT EXISTS idx_invites_email ON invites (email);
-`;
+/* Utils */
+const resend = new Resend(RESEND_API_KEY);
 
-async function dbInit() {
-  const c = await pool.connect();
-  try { await c.query(SQL_INIT); }
-  finally { c.release(); }
+function signToken(payloadObj) {
+  // simple HMAC-based token (base64url)
+  const payload = Buffer.from(JSON.stringify(payloadObj)).toString('base64url');
+  const sig = crypto.createHmac('sha256', INVITE_SIGNING_SECRET).update(payload).digest('base64url');
+  return `${payload}.${sig}`;
 }
-await dbInit();
+function verifyToken(token) {
+  const [payload, sig] = String(token).split('.');
+  if (!payload || !sig) return null;
+  const expect = crypto.createHmac('sha256', INVITE_SIGNING_SECRET).update(payload).digest('base64url');
+  if (sig !== expect) return null;
+  try { return JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')); }
+  catch { return null; }
+}
 
-/* ===== Email Template (EN only) ===== */
-function inviteEmailHtml({ workspaceName, acceptLink, downloadLink, deeplink }) {
-  const headline = `You’ve been invited to ${workspaceName}`;
-  const sub = `Click “Accept invitation” to join the workspace. You can also download the app below.`;
-  const buttonPrimary = `Accept invitation`;
-  const buttonDownload = `Download app`;
+/* Email HTML (English, 2 buttons) */
+function inviteHtml({ inviterEmail, role, acceptUrl, downloadUrl }) {
+  const safeInviter = inviterEmail.replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  const roleLabel = role === 'admin' ? 'Admin' : 'Member';
   return `
-  <div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;padding:24px;background:#0f0f0f;color:#eee;">
-    <div style="max-width:560px;margin:0 auto;background:#151515;border:1px solid #2a2a2a;border-radius:12px;padding:20px;">
-      <h2 style="margin:0 0 6px;font-size:20px;color:#fff;">${headline}</h2>
-      <p style="margin:8px 0 18px;color:#cfcfcf;">${sub}</p>
-
-      <a href="${acceptLink}" style="display:inline-block;padding:12px 16px;background:#ff5c33;border-radius:10px;color:#fff;text-decoration:none;font-weight:600;">
-        ${buttonPrimary}
-      </a>
-      <div style="height:10px"></div>
-      <a href="${downloadLink}" style="display:inline-block;padding:10px 14px;background:#1d1d1d;border:1px solid #2a2a2a;border-radius:10px;color:#fff;text-decoration:none;">
-        ${buttonDownload}
-      </a>
-
-      ${deeplink ? `
-      <div style="margin-top:14px;color:#9aa0a6;font-size:12px;">
-        If you already installed the app, you can also open it directly: <br/>
-        <code style="color:#eee;background:#111;padding:2px 6px;border-radius:6px;">${deeplink}</code>
-      </div>` : ''}
-
-      <hr style="border:none;border-top:1px solid #2a2a2a;margin:18px 0;">
-      <div style="color:#9aa0a6;font-size:12px;">
-        If you did not expect this email, you can ignore it.
-      </div>
+  <div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;max-width:560px;margin:0 auto;padding:24px;background:#0f0f0f;color:#eee">
+    <h2 style="margin:0 0 12px">You’re invited to Multi-Session CRM</h2>
+    <p style="margin:0 0 10px">Hello! <b>${safeInviter}</b> has invited you to join their workspace as <b>${roleLabel}</b>.</p>
+    <div style="height:14px"></div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap">
+      <a href="${acceptUrl}" style="text-decoration:none;padding:12px 14px;border-radius:10px;background:#ff5c33;color:#fff;display:inline-block">Accept invitation</a>
+      <a href="${downloadUrl}" style="text-decoration:none;padding:12px 14px;border-radius:10px;background:#222;color:#fff;display:inline-block">Download the app</a>
     </div>
+    <div style="height:14px"></div>
+    <p style="font-size:13px;color:#9aa0a6">If you didn’t expect this email, you can safely ignore it.</p>
   </div>`;
 }
 
-/* ===== Invite repository (SQL) ===== */
-async function createInvite({ workspaceId, email, role, invitedBy, ttlMinutes = 10080 /* 7 days */ }) {
-  const id = 'inv_' + nanoid(16);
-  const token = makeToken();
-  const tokenHash = sha256Base64url(token);
-  const expiresAt = new Date(Date.now() + ttlMinutes * 60 * 1000).toISOString();
+/* ==== API ==== */
 
-  const q = `
-    INSERT INTO invites (id, workspace_id, email, role, token_hash, status, invited_by, expires_at, last_sent_at)
-    VALUES ($1,$2,$3,$4,$5,'pending',$6,$7,NOW())
-    RETURNING id, workspace_id, email, role, status, invited_by, created_at, expires_at, last_sent_at
-  `;
-  const v = [id, workspaceId, email.toLowerCase(), role, tokenHash, invitedBy.toLowerCase(), expiresAt];
-  const { rows } = await pool.query(q, v);
-  return { record: rows[0], token };
-}
-async function listInvites({ workspaceId }) {
-  const { rows } = await pool.query(
-    `SELECT * FROM invites WHERE workspace_id=$1 ORDER BY created_at DESC LIMIT 200`,
-    [workspaceId]
-  );
-  return rows;
-}
-async function findInviteById(id) {
-  const { rows } = await pool.query(`SELECT * FROM invites WHERE id=$1`, [id]);
-  return rows[0] || null;
-}
-async function findPendingByEmail(workspaceId, email) {
-  const { rows } = await pool.query(
-    `SELECT * FROM invites WHERE workspace_id=$1 AND email=$2 AND status='pending' ORDER BY created_at DESC LIMIT 1`,
-    [workspaceId, email.toLowerCase()]
-  );
-  return rows[0] || null;
-}
-async function markCancelled(id) {
-  await pool.query(`UPDATE invites SET status='cancelled' WHERE id=$1`, [id]);
-}
-async function markAccepted(id) {
-  await pool.query(`UPDATE invites SET status='accepted', accepted_at=NOW() WHERE id=$1`, [id]);
-}
-async function updateLastSent(id) {
-  await pool.query(`UPDATE invites SET last_sent_at=NOW() WHERE id=$1`, [id]);
-}
-
-/* ===== Mail send helper ===== */
-async function sendInviteEmail({ to, workspaceName, acceptLink, downloadLink, deeplink }) {
-  const html = inviteEmailHtml({ workspaceName, acceptLink, downloadLink, deeplink });
-  const subject = `Invitation to ${workspaceName}`;
-  const headers = {};
-  // Optional: List-Unsubscribe (nicht benötigt bei Transaktionsmails)
-  // headers['List-Unsubscribe'] = `<mailto:unsubscribe@multi-session-cm.com>, <https://multi-session-cm.com/unsubscribe>`;
-
-  const payload = {
-    from: EMAIL_FROM,
-    to,
-    subject,
-    html,
-    headers
-  };
-  if (EMAIL_REPLY_TO) payload.reply_to = EMAIL_REPLY_TO;
-
-  const res = await resend.emails.send(payload);
-  return res;
-}
-
-/* ===== Routes ===== */
-
-// Healthcheck (Render needs this)
-app.get('/health', (_req, res) => {
-  res.status(200).json({ ok: true, ts: nowIso() });
-});
-
-// Create invite & send email
+/** Create + send invite */
 app.post('/api/invites', async (req, res) => {
   try {
-    const { workspaceId, workspaceName, inviteeEmail, role = 'member', invitedBy } = req.body || {};
-    if (!workspaceId || !inviteeEmail || !invitedBy) {
-      return res.status(400).json({ ok: false, error: 'workspaceId, inviteeEmail, invitedBy required' });
+    const { workspaceId, inviterEmail, inviteeEmail, role } = req.body || {};
+    if (!workspaceId || !inviterEmail || !inviteeEmail) {
+      return res.status(400).json({ ok:false, error:'missing_fields' });
     }
-    if (!['member','admin'].includes(role)) {
-      return res.status(400).json({ ok:false, error:'invalid role' });
-    }
+    const finalRole = (role === 'admin') ? 'admin' : 'member';
 
-    // de-dupe: existing pending?
-    const existing = await findPendingByEmail(workspaceId, inviteeEmail);
-    if (existing) {
-      return res.status(409).json({ ok:false, error:'invite_already_pending', inviteId: existing.id });
-    }
+    // create signed token
+    const tokenPayload = { workspaceId, inviteeEmail, role: finalRole, iat: Date.now() };
+    const token = signToken(tokenPayload);
 
-    const { record, token } = await createInvite({
-      workspaceId,
-      email: inviteeEmail,
-      role,
-      invitedBy,
-      ttlMinutes: 60 * 24 * 7 // 7 days
-    });
+    // persist
+    const q = `
+      insert into invites (workspace_id, inviter_email, invitee_email, role, status, token)
+      values ($1,$2,$3,$4,'pending',$5)
+      returning id, token, created_at
+    `;
+    const { rows } = await pool.query(q, [workspaceId, inviterEmail.toLowerCase(), inviteeEmail.toLowerCase(), finalRole, token]);
+    const row = rows[0];
 
-    const acceptLink = acceptUrlFromToken(`${record.id}.${token}`);
-    const deep = appDeepLink(record.id);
-    await sendInviteEmail({
+    // build links (landing pages – you’ll host them)
+    const acceptUrl = `${ACCEPT_BASE_URL}?token=${encodeURIComponent(token)}`;
+    const downloadUrl = `${DOWNLOAD_BASE_URL}`;
+
+    // send mail via Resend
+    const html = inviteHtml({ inviterEmail, role: finalRole, acceptUrl, downloadUrl });
+    const emailPayload = {
+      from: EMAIL_FROM,
       to: inviteeEmail,
-      workspaceName: workspaceName || 'Multi-Session CRM',
-      acceptLink,
-      downloadLink: downloadUrl(),
-      deeplink: deep
-    });
-    await updateLastSent(record.id);
+      subject: `You’re invited to Multi-Session CRM`,
+      html,
+      reply_to: EMAIL_REPLY_TO || undefined
+    };
 
-    res.json({ ok:true, inviteId: record.id, expiresAt: record.expires_at });
+    const sent = await resend.emails.send(emailPayload);
+    if (sent?.error) {
+      return res.status(500).json({ ok:false, error:'resend_error', details: sent.error });
+    }
+
+    return res.json({
+      ok: true,
+      inviteId: row.id,
+      token: row.token,
+      acceptUrl,
+      downloadUrl
+    });
   } catch (e) {
-    console.error('create invite error', e);
-    res.status(500).json({ ok:false, error:'internal_error' });
+    console.error('POST /api/invites', e);
+    return res.status(500).json({ ok:false, error:'server_error' });
   }
 });
 
-// List invites (by workspace)
-app.get('/api/invites', async (req, res) => {
+/** List invites (simple) */
+app.get('/api/invites', async (_req, res) => {
   try {
-    const { workspaceId } = req.query;
-    if (!workspaceId) return res.status(400).json({ ok:false, error:'workspaceId required' });
-    const rows = await listInvites({ workspaceId });
+    const { rows } = await pool.query(
+      `select id, workspace_id, inviter_email, invitee_email, role, status, created_at, accepted_at
+       from invites order by created_at desc limit 200`
+    );
     res.json({ ok:true, invites: rows });
   } catch (e) {
-    console.error('list invites error', e);
-    res.status(500).json({ ok:false, error:'internal_error' });
+    console.error('GET /api/invites', e);
+    res.status(500).json({ ok:false, error:'server_error' });
   }
 });
 
-// Resend invite
+/** Resend invite (keeps same token) */
 app.post('/api/invites/:id/resend', async (req, res) => {
   try {
-    const id = req.params.id;
-    const inv = await findInviteById(id);
-    if (!inv) return res.status(404).json({ ok:false, error:'not_found' });
-    if (inv.status !== 'pending') return res.status(400).json({ ok:false, error:'not_pending' });
+    const { id } = req.params;
+    const { rows } = await pool.query(`select * from invites where id = $1`, [id]);
+    if (!rows[0]) return res.status(404).json({ ok:false, error:'not_found' });
+    const inv = rows[0];
 
-    // build a fresh accept token while keeping the same invite id
-    const token = makeToken();
-    const newHash = sha256Base64url(token);
-    // rotate token_hash (optional, but safer)
-    await pool.query(`UPDATE invites SET token_hash=$1, expires_at=$2, last_sent_at=NOW() WHERE id=$3`,
-      [newHash, new Date(Date.now()+7*24*60*60*1000).toISOString(), id]);
+    const acceptUrl = `${ACCEPT_BASE_URL}?token=${encodeURIComponent(inv.token)}`;
+    const downloadUrl = `${DOWNLOAD_BASE_URL}`;
+    const html = inviteHtml({ inviterEmail: inv.inviter_email, role: inv.role, acceptUrl, downloadUrl });
 
-    const acceptLink = acceptUrlFromToken(`${id}.${token}`);
-    const deep = appDeepLink(id);
-    await sendInviteEmail({
-      to: inv.email,
-      workspaceName: 'Multi-Session CRM',
-      acceptLink,
-      downloadLink: downloadUrl(),
-      deeplink: deep
+    const sent = await resend.emails.send({
+      from: EMAIL_FROM,
+      to: inv.invitee_email,
+      subject: `Your invitation to Multi-Session CRM`,
+      html,
+      reply_to: EMAIL_REPLY_TO || undefined
     });
+    if (sent?.error) return res.status(500).json({ ok:false, error:'resend_error', details: sent.error });
+
     res.json({ ok:true });
   } catch (e) {
-    console.error('resend invite error', e);
-    res.status(500).json({ ok:false, error:'internal_error' });
+    console.error('POST /api/invites/:id/resend', e);
+    res.status(500).json({ ok:false, error:'server_error' });
   }
 });
 
-// Cancel invite
+/** Cancel invite */
 app.post('/api/invites/:id/cancel', async (req, res) => {
   try {
-    const id = req.params.id;
-    const inv = await findInviteById(id);
-    if (!inv) return res.status(404).json({ ok:false, error:'not_found' });
-    if (inv.status !== 'pending') return res.status(400).json({ ok:false, error:'not_pending' });
-    await markCancelled(id);
+    const { id } = req.params;
+    const { rowCount } = await pool.query(
+      `update invites set status='cancelled' where id=$1 and status='pending'`, [id]
+    );
+    if (rowCount === 0) return res.status(404).json({ ok:false, error:'not_found_or_not_pending' });
     res.json({ ok:true });
   } catch (e) {
-    console.error('cancel invite error', e);
-    res.status(500).json({ ok:false, error:'internal_error' });
+    console.error('POST /api/invites/:id/cancel', e);
+    res.status(500).json({ ok:false, error:'server_error' });
   }
 });
 
-/* ===== (Optional) Token verify endpoint (für deine Accept-Landingpage)
-   Frontend ruft z. B. /api/invites/verify?token=inv_xxx.SECRET
-   Antwort: ok + invite info → Client weiß, dass „Accept“ angeboten werden kann.
-===== */
-app.get('/api/invites/verify', async (req, res) => {
+/** Accept endpoint (token -> mark accepted) 
+ *  This is the API your Accept landing page will call (e.g. via fetch),
+ *  or you can 302-redirect to your landing page after we mark accepted.
+ */
+app.get('/api/invites/accept', async (req, res) => {
   try {
     const { token } = req.query;
-    if (!token || typeof token !== 'string') return res.status(400).json({ ok:false, error:'token required' });
+    if (!token) return res.status(400).send('missing token');
 
-    const [id, secret] = token.split('.');
-    if (!id || !secret) return res.status(400).json({ ok:false, error:'bad_token' });
+    const payload = verifyToken(token);
+    if (!payload) return res.status(400).send('invalid token');
 
-    const inv = await findInviteById(id);
-    if (!inv) return res.status(404).json({ ok:false, error:'not_found' });
-    if (inv.status !== 'pending') return res.status(400).json({ ok:false, error:'not_pending' });
+    const { rows } = await pool.query(`select * from invites where token=$1`, [token]);
+    if (!rows[0]) return res.status(404).send('invite not found');
+    if (rows[0].status === 'cancelled') return res.status(400).send('invite cancelled');
 
-    const expected = sha256Base64url(secret);
-    if (expected !== inv.token_hash) return res.status(400).json({ ok:false, error:'invalid_token' });
-
-    if (new Date(inv.expires_at).getTime() < Date.now()) {
-      return res.status(400).json({ ok:false, error:'expired' });
+    if (rows[0].status !== 'accepted') {
+      await pool.query(`update invites set status='accepted', accepted_at=now() where token=$1`, [token]);
     }
 
-    res.json({ ok:true, invite: {
-      id: inv.id,
-      workspaceId: inv.workspace_id,
-      email: inv.email,
-      role: inv.role,
-      expiresAt: inv.expires_at
-    }});
+    // Option A: redirect to your Accept landing page (passes token & email)
+    const redirect = `${ACCEPT_BASE_URL}?token=${encodeURIComponent(token)}&email=${encodeURIComponent(rows[0].invitee_email)}`;
+    res.redirect(302, redirect);
+
   } catch (e) {
-    console.error('verify invite error', e);
-    res.status(500).json({ ok:false, error:'internal_error' });
+    console.error('GET /api/invites/accept', e);
+    res.status(500).send('server error');
   }
 });
 
-/* ===== Server start ===== */
+/* Health */
+app.get('/health', (_req, res) => res.json({ ok:true, env: NODE_ENV }));
+
+/* Boot */
+await ensureSchema();
 app.listen(PORT, () => {
-  console.log(`[mcrm-mini] listening on :${PORT} (${NODE_ENV})`);
+  console.log(`[mcrm-mini] listening on ${PORT} (${NODE_ENV})`);
 });
