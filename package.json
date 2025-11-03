@@ -1,7 +1,7 @@
 {
   "name": "mcrm-mini",
-  "version": "1.1.0",
-  "description": "Invite + Email microservice for Multi-Session CRM (Resend + PostgreSQL + Express)",
+  "version": "1.2.0",
+  "description": "Invite + Accept + Server Login microservice for Multi-Session CRM (Resend + PostgreSQL + Express)",
   "type": "module",
   "main": "server.js",
   "scripts": {
@@ -12,7 +12,8 @@
     "cors": "^2.8.5",
     "express": "^4.19.2",
     "pg": "^8.11.3",
-    "resend": "^3.4.0"
+    "resend": "^3.4.0",
+    "bcryptjs": "^2.4.3"
   },
   "devDependencies": {
     "nodemon": "^3.0.3"
@@ -25,10 +26,9 @@
     "api",
     "invite",
     "resend",
-    "crm",
     "postgresql",
-    "multi-session",
-    "email"
+    "login",
+    "multi-session"
   ],
   "author": "4PM Digitalz LLC",
   "license": "MIT"
