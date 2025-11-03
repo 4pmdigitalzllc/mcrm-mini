@@ -1,21 +1,22 @@
-
 {
   "name": "mcrm-mini",
-  "version": "1.0.0",
-  "description": "Minimal Invite Server for Multi-Session CRM (Resend + JWT + Express)",
+  "version": "1.1.0",
+  "description": "Invite + Email microservice for Multi-Session CRM (Resend + PostgreSQL + Express)",
   "type": "module",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "dev": "nodemon server.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
-    "dotenv": "^16.4.5",
     "express": "^4.19.2",
-    "helmet": "^7.1.0",
-    "jsonwebtoken": "^9.0.2",
-    "nanoid": "^4.0.2",
-    "undici": "^6.19.8"
+    "pg": "^8.11.3",
+    "resend": "^3.4.0",
+    "crypto": "^1.0.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.3"
   },
   "engines": {
     "node": ">=18.x"
@@ -26,8 +27,9 @@
     "invite",
     "resend",
     "crm",
-    "jwt",
-    "multi-session"
+    "postgresql",
+    "multi-session",
+    "email"
   ],
   "author": "4PM Digitalz LLC",
   "license": "MIT"
