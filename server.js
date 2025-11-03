@@ -3,7 +3,7 @@
 
 import express from 'express';
 import cors from 'cors';
-import crypto from 'crypto';
+import crypto from 'node:crypto';
 import { Resend } from 'resend';
 import pkg from 'pg';
 
@@ -13,14 +13,14 @@ const { Pool } = pkg;
 const {
   PORT = 10000,
   NODE_ENV = 'production',
-  BASE_URL,                 // e.g. https://mcrm-mini.onrender.com
+  BASE_URL,                 
   ALLOWED_ORIGINS = '',
   RESEND_API_KEY,
   EMAIL_FROM,
   EMAIL_REPLY_TO,
-  ACCEPT_BASE_URL,          // e.g. https://invite.multi-session-crm.com/accept
-  DOWNLOAD_BASE_URL,        // e.g. https://invite.multi-session-crm.com/download
-  INVITE_SIGNING_SECRET,    // long random string
+  ACCEPT_BASE_URL,          
+  DOWNLOAD_BASE_URL,        
+  INVITE_SIGNING_SECRET,    
   DATABASE_URL,
   RATE_LIMIT_MAX = '30',
   RATE_LIMIT_WINDOW = '60000'
@@ -53,7 +53,7 @@ const allow = new Set(
 );
 app.use(cors({
   origin: (origin, cb) => {
-    if (!origin) return cb(null, true); // allow curl/postman
+    if (!origin) return cb(null, true); 
     if (allow.has(origin)) return cb(null, true);
     return cb(new Error('Not allowed by CORS: ' + origin));
   },
@@ -80,7 +80,6 @@ app.use((req, res, next) => {
 const pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
 
 async function ensureSchema() {
-  // idempotent – falls du mal „nackt“ startest
   const sql = `
     create extension if not exists pgcrypto;
     create table if not exists invites (
@@ -104,7 +103,6 @@ async function ensureSchema() {
 const resend = new Resend(RESEND_API_KEY);
 
 function signToken(payloadObj) {
-  // simple HMAC-based token (base64url)
   const payload = Buffer.from(JSON.stringify(payloadObj)).toString('base64url');
   const sig = crypto.createHmac('sha256', INVITE_SIGNING_SECRET).update(payload).digest('base64url');
   return `${payload}.${sig}`;
@@ -118,7 +116,7 @@ function verifyToken(token) {
   catch { return null; }
 }
 
-/* Email HTML (English, 2 buttons) */
+/* Email HTML */
 function inviteHtml({ inviterEmail, role, acceptUrl, downloadUrl }) {
   const safeInviter = inviterEmail.replace(/</g,'&lt;').replace(/>/g,'&gt;');
   const roleLabel = role === 'admin' ? 'Admin' : 'Member';
@@ -138,7 +136,6 @@ function inviteHtml({ inviterEmail, role, acceptUrl, downloadUrl }) {
 
 /* ==== API ==== */
 
-/** Create + send invite */
 app.post('/api/invites', async (req, res) => {
   try {
     const { workspaceId, inviterEmail, inviteeEmail, role } = req.body || {};
@@ -146,12 +143,9 @@ app.post('/api/invites', async (req, res) => {
       return res.status(400).json({ ok:false, error:'missing_fields' });
     }
     const finalRole = (role === 'admin') ? 'admin' : 'member';
-
-    // create signed token
     const tokenPayload = { workspaceId, inviteeEmail, role: finalRole, iat: Date.now() };
     const token = signToken(tokenPayload);
 
-    // persist
     const q = `
       insert into invites (workspace_id, inviter_email, invitee_email, role, status, token)
       values ($1,$2,$3,$4,'pending',$5)
@@ -160,12 +154,10 @@ app.post('/api/invites', async (req, res) => {
     const { rows } = await pool.query(q, [workspaceId, inviterEmail.toLowerCase(), inviteeEmail.toLowerCase(), finalRole, token]);
     const row = rows[0];
 
-    // build links (landing pages – you’ll host them)
     const acceptUrl = `${ACCEPT_BASE_URL}?token=${encodeURIComponent(token)}`;
     const downloadUrl = `${DOWNLOAD_BASE_URL}`;
-
-    // send mail via Resend
     const html = inviteHtml({ inviterEmail, role: finalRole, acceptUrl, downloadUrl });
+
     const emailPayload = {
       from: EMAIL_FROM,
       to: inviteeEmail,
@@ -192,7 +184,6 @@ app.post('/api/invites', async (req, res) => {
   }
 });
 
-/** List invites (simple) */
 app.get('/api/invites', async (_req, res) => {
   try {
     const { rows } = await pool.query(
@@ -206,7 +197,6 @@ app.get('/api/invites', async (_req, res) => {
   }
 });
 
-/** Resend invite (keeps same token) */
 app.post('/api/invites/:id/resend', async (req, res) => {
   try {
     const { id } = req.params;
@@ -234,7 +224,6 @@ app.post('/api/invites/:id/resend', async (req, res) => {
   }
 });
 
-/** Cancel invite */
 app.post('/api/invites/:id/cancel', async (req, res) => {
   try {
     const { id } = req.params;
@@ -249,10 +238,6 @@ app.post('/api/invites/:id/cancel', async (req, res) => {
   }
 });
 
-/** Accept endpoint (token -> mark accepted) 
- *  This is the API your Accept landing page will call (e.g. via fetch),
- *  or you can 302-redirect to your landing page after we mark accepted.
- */
 app.get('/api/invites/accept', async (req, res) => {
   try {
     const { token } = req.query;
@@ -269,7 +254,6 @@ app.get('/api/invites/accept', async (req, res) => {
       await pool.query(`update invites set status='accepted', accepted_at=now() where token=$1`, [token]);
     }
 
-    // Option A: redirect to your Accept landing page (passes token & email)
     const redirect = `${ACCEPT_BASE_URL}?token=${encodeURIComponent(token)}&email=${encodeURIComponent(rows[0].invitee_email)}`;
     res.redirect(302, redirect);
 
