@@ -1,11 +1,11 @@
-// server.js — mcrm-mini (Invite API + Email via Resend, Postgres persistence)
-// Node 18+ recommended
-
+// server.js — mcrm-mini (Invites + Accept + Server-Login, Resend + PostgreSQL)
+// Node >= 18
 import express from 'express';
 import cors from 'cors';
-import crypto from 'node:crypto';
+import crypto from 'crypto';
 import { Resend } from 'resend';
 import pkg from 'pg';
+import bcrypt from 'bcryptjs';
 
 const { Pool } = pkg;
 
@@ -13,16 +13,15 @@ const { Pool } = pkg;
 const {
   PORT = 10000,
   NODE_ENV = 'production',
-  BASE_URL,                 
   ALLOWED_ORIGINS = '',
   RESEND_API_KEY,
   EMAIL_FROM,
   EMAIL_REPLY_TO,
-  ACCEPT_BASE_URL,          
-  DOWNLOAD_BASE_URL,        
-  INVITE_SIGNING_SECRET,    
+  ACCEPT_BASE_URL,          // z.B. https://invite.multi-session-crm.com/accept
+  DOWNLOAD_BASE_URL,        // z.B. https://invite.multi-session-crm.com/download
+  INVITE_SIGNING_SECRET,
   DATABASE_URL,
-  RATE_LIMIT_MAX = '30',
+  RATE_LIMIT_MAX = '60',
   RATE_LIMIT_WINDOW = '60000'
 } = process.env;
 
@@ -44,16 +43,14 @@ must(DATABASE_URL, 'DATABASE_URL');
 const app = express();
 app.use(express.json({ limit: '1mb' }));
 
-/* CORS */
+/* CORS (App + Landingpages) */
 const allow = new Set(
-  ALLOWED_ORIGINS
-    .split(',')
-    .map(s => s.trim())
-    .filter(Boolean)
+  ALLOWED_ORIGINS.split(',').map(s => s.trim()).filter(Boolean)
 );
 app.use(cors({
   origin: (origin, cb) => {
-    if (!origin) return cb(null, true); 
+    // Electron / curl / Postman
+    if (!origin) return cb(null, true);
     if (allow.has(origin)) return cb(null, true);
     return cb(new Error('Not allowed by CORS: ' + origin));
   },
@@ -62,9 +59,9 @@ app.use(cors({
   methods: ['GET','POST','OPTIONS']
 }));
 
-/* Basic rate limit (in-memory) */
-const maxReq = parseInt(RATE_LIMIT_MAX, 10) || 30;
-const winMs = parseInt(RATE_LIMIT_WINDOW, 10) || 60000;
+/* Rate-Limit (einfach, in-memory) */
+const maxReq = parseInt(RATE_LIMIT_MAX, 10) || 60;
+const winMs  = parseInt(RATE_LIMIT_WINDOW, 10) || 60000;
 const ipHits = new Map();
 app.use((req, res, next) => {
   const now = Date.now();
@@ -82,6 +79,7 @@ const pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorize
 async function ensureSchema() {
   const sql = `
     create extension if not exists pgcrypto;
+
     create table if not exists invites (
       id uuid primary key default gen_random_uuid(),
       workspace_id text not null,
@@ -93,8 +91,19 @@ async function ensureSchema() {
       created_at timestamptz not null default now(),
       accepted_at timestamptz
     );
+
     create index if not exists idx_invites_invitee on invites (invitee_email);
     create index if not exists idx_invites_token on invites (token);
+
+    create table if not exists users (
+      id uuid primary key default gen_random_uuid(),
+      workspace_id text not null,
+      email text not null,
+      role text not null check (role in ('member','admin','owner')),
+      password_hash text not null,
+      created_at timestamptz not null default now(),
+      unique (workspace_id, email)
+    );
   `;
   await pool.query(sql);
 }
@@ -116,7 +125,7 @@ function verifyToken(token) {
   catch { return null; }
 }
 
-/* Email HTML */
+/* Email HTML (immer Englisch; UI bleibt Englisch, wie gewünscht) */
 function inviteHtml({ inviterEmail, role, acceptUrl, downloadUrl }) {
   const safeInviter = inviterEmail.replace(/</g,'&lt;').replace(/>/g,'&gt;');
   const roleLabel = role === 'admin' ? 'Admin' : 'Member';
@@ -134,8 +143,7 @@ function inviteHtml({ inviterEmail, role, acceptUrl, downloadUrl }) {
   </div>`;
 }
 
-/* ==== API ==== */
-
+/* ===== Invites: Create + Send ===== */
 app.post('/api/invites', async (req, res) => {
   try {
     const { workspaceId, inviterEmail, inviteeEmail, role } = req.body || {};
@@ -143,6 +151,7 @@ app.post('/api/invites', async (req, res) => {
       return res.status(400).json({ ok:false, error:'missing_fields' });
     }
     const finalRole = (role === 'admin') ? 'admin' : 'member';
+
     const tokenPayload = { workspaceId, inviteeEmail, role: finalRole, iat: Date.now() };
     const token = signToken(tokenPayload);
 
@@ -156,8 +165,8 @@ app.post('/api/invites', async (req, res) => {
 
     const acceptUrl = `${ACCEPT_BASE_URL}?token=${encodeURIComponent(token)}`;
     const downloadUrl = `${DOWNLOAD_BASE_URL}`;
-    const html = inviteHtml({ inviterEmail, role: finalRole, acceptUrl, downloadUrl });
 
+    const html = inviteHtml({ inviterEmail, role: finalRole, acceptUrl, downloadUrl });
     const emailPayload = {
       from: EMAIL_FROM,
       to: inviteeEmail,
@@ -184,6 +193,7 @@ app.post('/api/invites', async (req, res) => {
   }
 });
 
+/* ===== Invites: List / Resend / Cancel ===== */
 app.get('/api/invites', async (_req, res) => {
   try {
     const { rows } = await pool.query(
@@ -238,28 +248,115 @@ app.post('/api/invites/:id/cancel', async (req, res) => {
   }
 });
 
-app.get('/api/invites/accept', async (req, res) => {
+/* ===== Accept: Passwort setzen (API + minimale HTML-Fallback-Seite) ===== */
+
+/** POST /api/invites/accept
+ *  Body: { token, password }
+ *  Effekt: markiert Invite als accepted und legt/aktualisiert Nutzer (users) mit Passwort-Hash
+ */
+app.post('/api/invites/accept', async (req, res) => {
   try {
-    const { token } = req.query;
-    if (!token) return res.status(400).send('missing token');
+    const { token, password } = req.body || {};
+    if (!token || !password) return res.status(400).json({ ok:false, error:'missing_fields' });
 
     const payload = verifyToken(token);
-    if (!payload) return res.status(400).send('invalid token');
+    if (!payload) return res.status(400).json({ ok:false, error:'invalid_token' });
 
-    const { rows } = await pool.query(`select * from invites where token=$1`, [token]);
-    if (!rows[0]) return res.status(404).send('invite not found');
-    if (rows[0].status === 'cancelled') return res.status(400).send('invite cancelled');
+    const invQ = await pool.query(`select * from invites where token=$1`, [token]);
+    const inv = invQ.rows[0];
+    if (!inv) return res.status(404).json({ ok:false, error:'invite_not_found' });
+    if (inv.status === 'cancelled') return res.status(400).json({ ok:false, error:'invite_cancelled' });
 
-    if (rows[0].status !== 'accepted') {
+    // Passwort hashen & User upsert
+    const hash = await bcrypt.hash(password, 10);
+    await pool.query(`
+      insert into users (workspace_id, email, role, password_hash)
+      values ($1,$2,$3,$4)
+      on conflict (workspace_id, email)
+      do update set role=excluded.role, password_hash=excluded.password_hash
+    `, [inv.workspace_id, inv.invitee_email.toLowerCase(), inv.role, hash]);
+
+    if (inv.status !== 'accepted') {
       await pool.query(`update invites set status='accepted', accepted_at=now() where token=$1`, [token]);
     }
 
-    const redirect = `${ACCEPT_BASE_URL}?token=${encodeURIComponent(token)}&email=${encodeURIComponent(rows[0].invitee_email)}`;
-    res.redirect(302, redirect);
-
+    return res.json({ ok:true });
   } catch (e) {
-    console.error('GET /api/invites/accept', e);
+    console.error('POST /api/invites/accept', e);
+    res.status(500).json({ ok:false, error:'server_error' });
+  }
+});
+
+/** GET /api/invites/accept-page?token=...  (Minimal-HTML, falls du noch keine eigene Landingpage hast) */
+app.get('/api/invites/accept-page', async (req, res) => {
+  try {
+    const { token } = req.query || {};
+    if (!token) return res.status(400).send('missing token');
+    const payload = verifyToken(token);
+    if (!payload) return res.status(400).send('invalid token');
+
+    // sehr einfache Inline-Seite
+    res.type('html').send(`<!doctype html>
+<html><head><meta charset="utf-8"><title>Accept Invitation</title></head>
+<body style="font-family:system-ui;background:#0f0f0f;color:#eee;padding:24px">
+  <h2>Accept invitation</h2>
+  <p>Set your password to join the workspace.</p>
+  <form id="f" style="display:grid;gap:10px;max-width:360px">
+    <input type="password" id="pw" placeholder="New password" style="padding:10px;border-radius:8px;border:1px solid #333;background:#141414;color:#eee">
+    <button type="submit" style="padding:10px;border-radius:8px;background:#ff5c33;color:#fff;border:0">Save password</button>
+  </form>
+  <div id="msg" style="margin-top:10px;color:#9aa0a6"></div>
+  <script>
+    const t = ${JSON.stringify(String(token))};
+    document.getElementById('f').addEventListener('submit', async (e)=>{
+      e.preventDefault();
+      const pw = document.getElementById('pw').value;
+      const r = await fetch('/api/invites/accept', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ token: t, password: pw })
+      });
+      const j = await r.json().catch(()=>null);
+      const m = document.getElementById('msg');
+      if(!j || !j.ok){ m.textContent = 'Error saving password.'; return; }
+      m.textContent = 'Password saved. You can now download the app.';
+      setTimeout(()=>{ window.location.href = ${JSON.stringify(DOWNLOAD_BASE_URL)}; }, 800);
+    });
+  </script>
+</body></html>`);
+  } catch (e) {
+    console.error('GET /api/invites/accept-page', e);
     res.status(500).send('server error');
+  }
+});
+
+/* ===== Auth: Login ===== */
+/** POST /api/auth/login  { workspaceId, email, password } */
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { workspaceId, email, password } = req.body || {};
+    if (!workspaceId || !email || !password) {
+      return res.status(400).json({ ok:false, error:'missing_fields' });
+    }
+    const q = await pool.query(`select * from users where workspace_id=$1 and email=$2`,
+      [workspaceId, String(email).toLowerCase()]);
+    const u = q.rows[0];
+    if (!u) return res.status(401).json({ ok:false, error:'invalid_credentials' });
+    const ok = await bcrypt.compare(password, u.password_hash);
+    if (!ok) return res.status(401).json({ ok:false, error:'invalid_credentials' });
+
+    // (Optional) stateless: sign a lightweight token (HMAC) – reicht als Session-Token
+    const token = signToken({ workspaceId, email: u.email, role: u.role, iat: Date.now() });
+
+    res.json({
+      ok: true,
+      token,
+      email: u.email,
+      role: u.role,
+      workspaceId: u.workspace_id
+    });
+  } catch (e) {
+    console.error('POST /api/auth/login', e);
+    res.status(500).json({ ok:false, error:'server_error' });
   }
 });
 
