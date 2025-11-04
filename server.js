@@ -56,7 +56,7 @@ app.use(cors({
   },
   credentials: false,
   allowedHeaders: ['Content-Type', 'Authorization'],
-  methods: ['GET','POST','OPTIONS']
+  methods: ['GET','POST','OPTIONS'] // POST reicht auch für "remove"
 }));
 
 /* Rate-Limit (einfach, in-memory) */
@@ -73,7 +73,7 @@ app.use((req, res, next) => {
   next();
 });
 
-/* Postgres */
+/* ===== Postgres ===== */
 const pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
 
 async function ensureSchema() {
@@ -102,6 +102,7 @@ async function ensureSchema() {
       role text not null check (role in ('member','admin','owner')),
       password_hash text not null,
       name text default 'User',
+      status text not null default 'active' check (status in ('active','disabled')),
       created_at timestamptz not null default now(),
       unique (workspace_id, email)
     );
@@ -131,7 +132,7 @@ function authFromHeader(req) {
   return verifyToken(h.slice(7));
 }
 
-/* Email HTML */
+/* ===== Email HTML ===== */
 function inviteHtml({ inviterEmail, role, acceptUrl, downloadUrl }) {
   const safeInviter = inviterEmail.replace(/</g,'&lt;').replace(/>/g,'&gt;');
   const roleLabel = role === 'admin' ? 'Admin' : 'Member';
@@ -176,9 +177,9 @@ app.post('/api/auth/signup_owner', async (req, res) => {
 
     const hash = await bcrypt.hash(password, 10);
     const ins = await pool.query(
-      `insert into users (workspace_id,email,role,password_hash,name)
-       values ($1,$2,'owner',$3,$4)
-       returning id, workspace_id, email, role, name, created_at`,
+      `insert into users (workspace_id,email,role,password_hash,name,status)
+       values ($1,$2,'owner',$3,$4,'active')
+       returning id, workspace_id, email, role, name, status, created_at`,
       [wsid, mail, hash, name || 'Owner']
     );
 
@@ -198,10 +199,18 @@ app.post('/api/auth/login', async (req, res) => {
     if (!workspaceId || !email || !password) {
       return res.status(400).json({ ok:false, error:'missing_fields' });
     }
-    const q = await pool.query(`select * from users where workspace_id=$1 and email=$2`,
-      [String(workspaceId), String(email).toLowerCase()]);
+    const q = await pool.query(
+      `select * from users where workspace_id=$1 and email=$2`,
+      [String(workspaceId), String(email).toLowerCase()]
+    );
     const u = q.rows[0];
     if (!u) return res.status(401).json({ ok:false, error:'invalid_credentials' });
+
+    // NEW: disabled blocken
+    if (u.status !== 'active') {
+      return res.status(403).json({ ok:false, error:'user_disabled' });
+    }
+
     const ok = await bcrypt.compare(password, u.password_hash);
     if (!ok) return res.status(401).json({ ok:false, error:'invalid_credentials' });
 
@@ -221,13 +230,18 @@ app.get('/api/me', async (req, res) => {
     if (!sess) return res.status(401).json({ ok:false, error:'no_or_bad_token' });
 
     const meQ = await pool.query(
-      `select id,workspace_id,email,role,name,created_at from users where workspace_id=$1 and email=$2`,
+      `select id,workspace_id,email,role,name,status,created_at
+         from users
+        where workspace_id=$1 and email=$2`,
       [sess.workspaceId, String(sess.email).toLowerCase()]
     );
     const me = meQ.rows[0] || null;
 
     const teamQ = await pool.query(
-      `select id,email,role,name,created_at from users where workspace_id=$1 order by role desc, created_at asc`,
+      `select id,email,role,name,status,created_at
+         from users
+        where workspace_id=$1
+        order by (role='owner') desc, (role='admin') desc, email asc`,
       [sess.workspaceId]
     );
 
@@ -246,17 +260,13 @@ app.get('/api/me', async (req, res) => {
 });
 
 /* ===== Invites: Create + Send ===== */
-/** POST /api/invites
- * Body (wie bisher): { workspaceId, inviterEmail, inviteeEmail, role }
- * Optional: Authorization Header → überschreibt workspaceId & inviterEmail mit Token-Daten.
- */
 app.post('/api/invites', async (req, res) => {
   try {
     const maybe = authFromHeader(req);
     const body = req.body || {};
 
     const workspaceId = (maybe?.workspaceId) || body.workspaceId;
-    const inviterEmail = (maybe?.email) || body.inviterEmail;
+    const inviterEmail = (maybe?.email)       || body.inviterEmail;
     const inviteeEmail = body.inviteeEmail;
     const role = body.role === 'admin' ? 'admin' : 'member';
 
@@ -308,7 +318,9 @@ app.get('/api/invites', async (_req, res) => {
   try {
     const { rows } = await pool.query(
       `select id, workspace_id, inviter_email, invitee_email, role, status, created_at, accepted_at
-       from invites order by created_at desc limit 200`
+         from invites
+        order by created_at desc
+        limit 200`
     );
     res.json({ ok:true, invites: rows });
   } catch (e) {
@@ -348,7 +360,8 @@ app.post('/api/invites/:id/cancel', async (req, res) => {
   try {
     const { id } = req.params;
     const { rowCount } = await pool.query(
-      `update invites set status='cancelled' where id=$1 and status='pending'`, [id]
+      `update invites set status='cancelled' where id=$1 and status='pending'`,
+      [id]
     );
     if (rowCount === 0) return res.status(404).json({ ok:false, error:'not_found_or_not_pending' });
     res.json({ ok:true });
@@ -359,7 +372,6 @@ app.post('/api/invites/:id/cancel', async (req, res) => {
 });
 
 /* ===== Accept: Passwort setzen (API + Minimal-HTML) ===== */
-
 app.post('/api/invites/accept', async (req, res) => {
   try {
     const { token, password, name } = req.body || {};
@@ -375,11 +387,15 @@ app.post('/api/invites/accept', async (req, res) => {
 
     const pwHash = await bcrypt.hash(password, 10);
 
+    // NEW: Accept setzt/reaktiviert status='active'
     await pool.query(`
-      insert into users (workspace_id, email, role, password_hash, name)
-      values ($1,$2,$3,$4,$5)
+      insert into users (workspace_id, email, role, password_hash, name, status)
+      values ($1,$2,$3,$4,$5,'active')
       on conflict (workspace_id, email)
-      do update set role=excluded.role, password_hash=excluded.password_hash
+      do update set role=excluded.role,
+                    password_hash=excluded.password_hash,
+                    name=excluded.name,
+                    status='active'
     `, [
       inv.workspace_id,
       inv.invitee_email.toLowerCase(),
@@ -436,6 +452,58 @@ app.get('/api/invites/accept-page', async (req, res) => {
   } catch (e) {
     console.error('GET /api/invites/accept-page', e);
     res.status(500).send('server error');
+  }
+});
+
+/* ===== Team: aus DB listen & Member entfernen (disable) ===== */
+
+// GET /api/team?workspaceId=ws-123
+app.get('/api/team', async (req, res) => {
+  try {
+    const { workspaceId } = req.query || {};
+    if (!workspaceId) return res.status(400).json({ ok:false, error:'missing_workspaceId' });
+
+    const { rows } = await pool.query(
+      `select email, role, name, status, created_at
+         from users
+        where workspace_id=$1
+        order by (role='owner') desc, (role='admin') desc, email asc`,
+      [String(workspaceId)]
+    );
+
+    res.json({ ok:true, users: rows });
+  } catch (e) {
+    console.error('GET /api/team', e);
+    res.status(500).json({ ok:false, error:'server_error' });
+  }
+});
+
+// POST /api/team/remove  { workspaceId, targetEmail }
+app.post('/api/team/remove', async (req, res) => {
+  try {
+    const { workspaceId, targetEmail } = req.body || {};
+    if (!workspaceId || !targetEmail) {
+      return res.status(400).json({ ok:false, error:'missing_fields' });
+    }
+
+    const q = await pool.query(
+      `select role, status from users where workspace_id=$1 and email=$2`,
+      [String(workspaceId), String(targetEmail).toLowerCase()]
+    );
+    const found = q.rows[0];
+    if (!found) return res.status(404).json({ ok:false, error:'user_not_found' });
+    if (found.role === 'owner') return res.status(400).json({ ok:false, error:'cannot_remove_owner' });
+
+    // Soft-Remove → status='disabled'
+    await pool.query(
+      `update users set status='disabled' where workspace_id=$1 and email=$2`,
+      [String(workspaceId), String(targetEmail).toLowerCase()]
+    );
+
+    return res.json({ ok:true });
+  } catch (e) {
+    console.error('POST /api/team/remove', e);
+    res.status(500).json({ ok:false, error:'server_error' });
   }
 });
 
