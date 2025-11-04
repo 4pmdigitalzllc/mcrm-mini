@@ -101,6 +101,7 @@ async function ensureSchema() {
       email text not null,
       role text not null check (role in ('member','admin','owner')),
       password_hash text not null,
+      name text default 'User',
       created_at timestamptz not null default now(),
       unique (workspace_id, email)
     );
@@ -108,7 +109,7 @@ async function ensureSchema() {
   await pool.query(sql);
 }
 
-/* Utils */
+/* ==== Token Utils (HMAC, stateless) ==== */
 const resend = new Resend(RESEND_API_KEY);
 
 function signToken(payloadObj) {
@@ -117,15 +118,20 @@ function signToken(payloadObj) {
   return `${payload}.${sig}`;
 }
 function verifyToken(token) {
-  const [payload, sig] = String(token).split('.');
+  const [payload, sig] = String(token || '').split('.');
   if (!payload || !sig) return null;
   const expect = crypto.createHmac('sha256', INVITE_SIGNING_SECRET).update(payload).digest('base64url');
   if (sig !== expect) return null;
   try { return JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')); }
   catch { return null; }
 }
+function authFromHeader(req) {
+  const h = req.headers.authorization || '';
+  if (!h.startsWith('Bearer ')) return null;
+  return verifyToken(h.slice(7));
+}
 
-/* Email HTML (immer Englisch; UI bleibt Englisch, wie gewünscht) */
+/* Email HTML */
 function inviteHtml({ inviterEmail, role, acceptUrl, downloadUrl }) {
   const safeInviter = inviterEmail.replace(/</g,'&lt;').replace(/>/g,'&gt;');
   const roleLabel = role === 'admin' ? 'Admin' : 'Member';
@@ -143,16 +149,122 @@ function inviteHtml({ inviterEmail, role, acceptUrl, downloadUrl }) {
   </div>`;
 }
 
+/* ===== Health ===== */
+app.get('/health', (_req, res) => res.json({ ok:true, env: NODE_ENV }));
+
+/* ===== AUTH: Owner-Signup ===== */
+/** POST /api/auth/signup_owner
+ * Body: { workspaceId, email, name, password }
+ * Ergebnis: legt Owner-User an (falls nicht vorhanden) und gibt Session-Token zurück
+ */
+app.post('/api/auth/signup_owner', async (req, res) => {
+  try {
+    const { workspaceId, email, name, password } = req.body || {};
+    if (!workspaceId || !email || !password) {
+      return res.status(400).json({ ok:false, error:'missing_fields' });
+    }
+    const wsid = String(workspaceId).trim();
+    const mail = String(email).toLowerCase().trim();
+
+    const exists = await pool.query(
+      'select id from users where workspace_id=$1 and email=$2',
+      [wsid, mail]
+    );
+    if (exists.rowCount > 0) {
+      return res.status(409).json({ ok:false, error:'owner_exists' });
+    }
+
+    const hash = await bcrypt.hash(password, 10);
+    const ins = await pool.query(
+      `insert into users (workspace_id,email,role,password_hash,name)
+       values ($1,$2,'owner',$3,$4)
+       returning id, workspace_id, email, role, name, created_at`,
+      [wsid, mail, hash, name || 'Owner']
+    );
+
+    const token = signToken({ workspaceId: wsid, email: mail, role: 'owner', iat: Date.now() });
+    return res.json({ ok:true, token, user: ins.rows[0] });
+  } catch (e) {
+    console.error('POST /api/auth/signup_owner', e);
+    res.status(500).json({ ok:false, error:'server_error' });
+  }
+});
+
+/* ===== Auth: Login ===== */
+/** POST /api/auth/login  { workspaceId, email, password } */
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { workspaceId, email, password } = req.body || {};
+    if (!workspaceId || !email || !password) {
+      return res.status(400).json({ ok:false, error:'missing_fields' });
+    }
+    const q = await pool.query(`select * from users where workspace_id=$1 and email=$2`,
+      [String(workspaceId), String(email).toLowerCase()]);
+    const u = q.rows[0];
+    if (!u) return res.status(401).json({ ok:false, error:'invalid_credentials' });
+    const ok = await bcrypt.compare(password, u.password_hash);
+    if (!ok) return res.status(401).json({ ok:false, error:'invalid_credentials' });
+
+    const token = signToken({ workspaceId: u.workspace_id, email: u.email, role: u.role, iat: Date.now() });
+    res.json({ ok:true, token, email: u.email, role: u.role, workspaceId: u.workspace_id, name: u.name });
+  } catch (e) {
+    console.error('POST /api/auth/login', e);
+    res.status(500).json({ ok:false, error:'server_error' });
+  }
+});
+
+/* ===== Session: /me ===== */
+/** GET /api/me   (Authorization: Bearer <token>) */
+app.get('/api/me', async (req, res) => {
+  try {
+    const sess = authFromHeader(req);
+    if (!sess) return res.status(401).json({ ok:false, error:'no_or_bad_token' });
+
+    const meQ = await pool.query(
+      `select id,workspace_id,email,role,name,created_at from users where workspace_id=$1 and email=$2`,
+      [sess.workspaceId, String(sess.email).toLowerCase()]
+    );
+    const me = meQ.rows[0] || null;
+
+    const teamQ = await pool.query(
+      `select id,email,role,name,created_at from users where workspace_id=$1 order by role desc, created_at asc`,
+      [sess.workspaceId]
+    );
+
+    res.json({
+      ok: true,
+      user: me,
+      workspace: {
+        id: sess.workspaceId,
+        users: teamQ.rows
+      }
+    });
+  } catch (e) {
+    console.error('GET /api/me', e);
+    res.status(500).json({ ok:false, error:'server_error' });
+  }
+});
+
 /* ===== Invites: Create + Send ===== */
+/** POST /api/invites
+ * Body (wie bisher): { workspaceId, inviterEmail, inviteeEmail, role }
+ * Optional: Authorization Header → überschreibt workspaceId & inviterEmail mit Token-Daten.
+ */
 app.post('/api/invites', async (req, res) => {
   try {
-    const { workspaceId, inviterEmail, inviteeEmail, role } = req.body || {};
+    const maybe = authFromHeader(req);
+    const body = req.body || {};
+
+    const workspaceId = (maybe?.workspaceId) || body.workspaceId;
+    const inviterEmail = (maybe?.email) || body.inviterEmail;
+    const inviteeEmail = body.inviteeEmail;
+    const role = body.role === 'admin' ? 'admin' : 'member';
+
     if (!workspaceId || !inviterEmail || !inviteeEmail) {
       return res.status(400).json({ ok:false, error:'missing_fields' });
     }
-    const finalRole = (role === 'admin') ? 'admin' : 'member';
 
-    const tokenPayload = { workspaceId, inviteeEmail, role: finalRole, iat: Date.now() };
+    const tokenPayload = { workspaceId, inviteeEmail, role, iat: Date.now() };
     const token = signToken(tokenPayload);
 
     const q = `
@@ -160,33 +272,31 @@ app.post('/api/invites', async (req, res) => {
       values ($1,$2,$3,$4,'pending',$5)
       returning id, token, created_at
     `;
-    const { rows } = await pool.query(q, [workspaceId, inviterEmail.toLowerCase(), inviteeEmail.toLowerCase(), finalRole, token]);
+    const { rows } = await pool.query(q, [
+      String(workspaceId),
+      String(inviterEmail).toLowerCase(),
+      String(inviteeEmail).toLowerCase(),
+      role,
+      token
+    ]);
     const row = rows[0];
 
     const acceptUrl = `${ACCEPT_BASE_URL}?token=${encodeURIComponent(token)}`;
     const downloadUrl = `${DOWNLOAD_BASE_URL}`;
+    const html = inviteHtml({ inviterEmail, role, acceptUrl, downloadUrl });
 
-    const html = inviteHtml({ inviterEmail, role: finalRole, acceptUrl, downloadUrl });
-    const emailPayload = {
+    const sent = await resend.emails.send({
       from: EMAIL_FROM,
       to: inviteeEmail,
       subject: `You’re invited to Multi-Session CRM`,
       html,
       reply_to: EMAIL_REPLY_TO || undefined
-    };
-
-    const sent = await resend.emails.send(emailPayload);
+    });
     if (sent?.error) {
       return res.status(500).json({ ok:false, error:'resend_error', details: sent.error });
     }
 
-    return res.json({
-      ok: true,
-      inviteId: row.id,
-      token: row.token,
-      acceptUrl,
-      downloadUrl
-    });
+    return res.json({ ok:true, inviteId: row.id, token: row.token, acceptUrl, downloadUrl });
   } catch (e) {
     console.error('POST /api/invites', e);
     return res.status(500).json({ ok:false, error:'server_error' });
@@ -248,15 +358,11 @@ app.post('/api/invites/:id/cancel', async (req, res) => {
   }
 });
 
-/* ===== Accept: Passwort setzen (API + minimale HTML-Fallback-Seite) ===== */
+/* ===== Accept: Passwort setzen (API + Minimal-HTML) ===== */
 
-/** POST /api/invites/accept
- *  Body: { token, password }
- *  Effekt: markiert Invite als accepted und legt/aktualisiert Nutzer (users) mit Passwort-Hash
- */
 app.post('/api/invites/accept', async (req, res) => {
   try {
-    const { token, password } = req.body || {};
+    const { token, password, name } = req.body || {};
     if (!token || !password) return res.status(400).json({ ok:false, error:'missing_fields' });
 
     const payload = verifyToken(token);
@@ -267,14 +373,20 @@ app.post('/api/invites/accept', async (req, res) => {
     if (!inv) return res.status(404).json({ ok:false, error:'invite_not_found' });
     if (inv.status === 'cancelled') return res.status(400).json({ ok:false, error:'invite_cancelled' });
 
-    // Passwort hashen & User upsert
-    const hash = await bcrypt.hash(password, 10);
+    const pwHash = await bcrypt.hash(password, 10);
+
     await pool.query(`
-      insert into users (workspace_id, email, role, password_hash)
-      values ($1,$2,$3,$4)
+      insert into users (workspace_id, email, role, password_hash, name)
+      values ($1,$2,$3,$4,$5)
       on conflict (workspace_id, email)
       do update set role=excluded.role, password_hash=excluded.password_hash
-    `, [inv.workspace_id, inv.invitee_email.toLowerCase(), inv.role, hash]);
+    `, [
+      inv.workspace_id,
+      inv.invitee_email.toLowerCase(),
+      inv.role,
+      pwHash,
+      name || inv.invitee_email.split('@')[0]
+    ]);
 
     if (inv.status !== 'accepted') {
       await pool.query(`update invites set status='accepted', accepted_at=now() where token=$1`, [token]);
@@ -287,7 +399,6 @@ app.post('/api/invites/accept', async (req, res) => {
   }
 });
 
-/** GET /api/invites/accept-page?token=...  (Minimal-HTML, falls du noch keine eigene Landingpage hast) */
 app.get('/api/invites/accept-page', async (req, res) => {
   try {
     const { token } = req.query || {};
@@ -295,7 +406,6 @@ app.get('/api/invites/accept-page', async (req, res) => {
     const payload = verifyToken(token);
     if (!payload) return res.status(400).send('invalid token');
 
-    // sehr einfache Inline-Seite
     res.type('html').send(`<!doctype html>
 <html><head><meta charset="utf-8"><title>Accept Invitation</title></head>
 <body style="font-family:system-ui;background:#0f0f0f;color:#eee;padding:24px">
@@ -329,41 +439,7 @@ app.get('/api/invites/accept-page', async (req, res) => {
   }
 });
 
-/* ===== Auth: Login ===== */
-/** POST /api/auth/login  { workspaceId, email, password } */
-app.post('/api/auth/login', async (req, res) => {
-  try {
-    const { workspaceId, email, password } = req.body || {};
-    if (!workspaceId || !email || !password) {
-      return res.status(400).json({ ok:false, error:'missing_fields' });
-    }
-    const q = await pool.query(`select * from users where workspace_id=$1 and email=$2`,
-      [workspaceId, String(email).toLowerCase()]);
-    const u = q.rows[0];
-    if (!u) return res.status(401).json({ ok:false, error:'invalid_credentials' });
-    const ok = await bcrypt.compare(password, u.password_hash);
-    if (!ok) return res.status(401).json({ ok:false, error:'invalid_credentials' });
-
-    // (Optional) stateless: sign a lightweight token (HMAC) – reicht als Session-Token
-    const token = signToken({ workspaceId, email: u.email, role: u.role, iat: Date.now() });
-
-    res.json({
-      ok: true,
-      token,
-      email: u.email,
-      role: u.role,
-      workspaceId: u.workspace_id
-    });
-  } catch (e) {
-    console.error('POST /api/auth/login', e);
-    res.status(500).json({ ok:false, error:'server_error' });
-  }
-});
-
-/* Health */
-app.get('/health', (_req, res) => res.json({ ok:true, env: NODE_ENV }));
-
-/* Boot */
+/* ===== Boot ===== */
 await ensureSchema();
 app.listen(PORT, () => {
   console.log(`[mcrm-mini] listening on ${PORT} (${NODE_ENV})`);
