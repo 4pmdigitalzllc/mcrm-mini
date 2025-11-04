@@ -1,6 +1,6 @@
 {
   "name": "mcrm-mini",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Invite + Accept + Server Login microservice for Multi-Session CRM (Resend + PostgreSQL + Express)",
   "type": "module",
   "main": "server.js",
@@ -9,11 +9,11 @@
     "dev": "nodemon server.js"
   },
   "dependencies": {
+    "bcryptjs": "^2.4.3",
     "cors": "^2.8.5",
     "express": "^4.19.2",
     "pg": "^8.11.3",
-    "resend": "^3.4.0",
-    "bcryptjs": "^2.4.3"
+    "resend": "^3.4.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.3"
