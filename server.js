@@ -167,6 +167,7 @@ app.get('/api/invites/accept-page', async (req, res) => {
         .send('<h2 style="font-family:system-ui;color:#fff;background:#0f0f0f;padding:2rem">Invitation not found.</h2>');
     }
     if (inv.status === 'accepted') {
+      // iOS/Gmail fix: echter Link statt onclick-Button
       return res.type('html').send(`<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -178,14 +179,17 @@ app.get('/api/invites/accept-page', async (req, res) => {
         box-shadow:0 0 30px rgba(0,0,0,.4)}
   h2{margin:0 0 12px}
   p{color:#aaa;margin:0 0 22px}
-  button{padding:12px 16px;border:0;border-radius:8px;background:#ff5c33;color:#fff;cursor:pointer;font-weight:600}
-  button:hover{background:#ff704d}
+  .btn{
+    display:inline-block; padding:12px 16px; border:0; border-radius:8px;
+    background:#ff5c33; color:#fff; font-weight:600; text-decoration:none; cursor:pointer;
+  }
+  .btn:hover{background:#ff704d}
 </style></head>
 <body>
   <div class="card">
     <h2>This invitation was already accepted</h2>
     <p>Your access is ready. Download the app and log in with your email and the password you set.</p>
-    <button onclick="window.location.href=${JSON.stringify(DOWNLOAD_BASE_URL)}">Go to download</button>
+    <a href=${JSON.stringify(DOWNLOAD_BASE_URL)} class="btn">Go to download</a>
   </div>
 </body></html>`);
     }
