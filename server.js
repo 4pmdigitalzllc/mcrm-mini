@@ -151,8 +151,118 @@ function inviteHtml({ inviterEmail, role, acceptUrl, downloadUrl }) {
 }
 
 /* ===== Health ===== */
-app.get('/health', (_req, res) => res.json({ ok:true, env: NODE_ENV }));
+app.get('/api/invites/accept-page', async (req, res) => {
+  try {
+    const { token } = req.query || {};
+    if (!token) return res.status(400).send('missing token');
+    const payload = verifyToken(token);
+    if (!payload) return res.status(400).send('invalid token');
 
+    res.type('html').send(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Accept Invitation</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body {
+      background-color: #0f0f0f;
+      color: #fff;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+      margin: 0;
+    }
+    .container {
+      width: 90%;
+      max-width: 400px;
+      text-align: center;
+    }
+    h2 {
+      font-size: 1.8rem;
+      margin-bottom: 1rem;
+    }
+    p {
+      font-size: 1.1rem;
+      color: #ccc;
+      margin-bottom: 1.5rem;
+    }
+    input[type="password"] {
+      width: 100%;
+      padding: 14px;
+      border: none;
+      border-radius: 8px;
+      background-color: #1c1c1c;
+      color: #fff;
+      font-size: 1.1rem;
+      margin-bottom: 1rem;
+      box-sizing: border-box;
+    }
+    input[type="password"]:focus {
+      outline: 2px solid #ff5c33;
+    }
+    button {
+      width: 100%;
+      padding: 14px;
+      border: none;
+      border-radius: 8px;
+      background-color: #ff5c33;
+      color: #fff;
+      font-size: 1.1rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.2s ease;
+    }
+    button:hover {
+      background-color: #ff704d;
+    }
+    #msg {
+      margin-top: 1rem;
+      font-size: 0.95rem;
+      color: #9aa0a6;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h2>Accept invitation</h2>
+    <p>Set your password to join the workspace.</p>
+    <form id="f">
+      <input type="password" id="pw" placeholder="New password">
+      <button type="submit">Save password</button>
+    </form>
+    <div id="msg"></div>
+  </div>
+  <script>
+    const t = ${JSON.stringify(String(token))};
+    document.getElementById('f').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const pw = document.getElementById('pw').value.trim();
+      const msg = document.getElementById('msg');
+      if (!pw) { msg.textContent = 'Please enter a password.'; return; }
+      const r = await fetch('/api/invites/accept', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: t, password: pw })
+      });
+      const j = await r.json().catch(() => null);
+      if (!j || !j.ok) {
+        msg.textContent = 'Error saving password.';
+        return;
+      }
+      msg.textContent = 'Password saved. Redirecting...';
+      setTimeout(() => { window.location.href = ${JSON.stringify(DOWNLOAD_BASE_URL)}; }, 1000);
+    });
+  </script>
+</body>
+</html>`);
+  } catch (e) {
+    console.error('GET /api/invites/accept-page', e);
+    res.status(500).send('server error');
+  }
+});
 /* ===== AUTH: Owner-Signup ===== */
 /** POST /api/auth/signup_owner
  * Body: { workspaceId, email, name, password }
