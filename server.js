@@ -150,92 +150,8 @@ function inviteHtml({ inviterEmail, role, acceptUrl, downloadUrl }) {
   </div>`;
 }
 
-/* ===== Health ===== */
+/* ===== Accept Page (single, clean implementation) ===== */
 app.get('/api/invites/accept-page', async (req, res) => {
-  try {
-    const { token } = req.query || {};
-    if (!token) return res.status(400).send('missing token');
-    const payload = verifyToken(token);
-    if (!payload) return res.status(400).send('invalid token');
-
-    res.type('html').send(`<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <title>Accept Invitation</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <style>
-    body {
-      background-color: #0f0f0f;
-      color: #fff;
-      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      height: 100vh;
-      margin: 0;
-    }
-    .container {
-      width: 90%;
-      max-width: 400px;
-      text-align: center;
-    }
-    h2 {
-      font-size: 1.8rem;
-      margin-bottom: 1rem;
-    }
-    p {
-      font-size: 1.1rem;
-      color: #ccc;
-      margin-bottom: 1.5rem;
-    }
-    input[type="password"] {
-      width: 100%;
-      padding: 14px;
-      border: none;
-      border-radius: 8px;
-      background-color: #1c1c1c;
-      color: #fff;
-      font-size: 1.1rem;
-      margin-bottom: 1rem;
-      box-sizing: border-box;
-    }
-    input[type="password"]:focus {
-      outline: 2px solid #ff5c33;
-    }
-    button {
-      width: 100%;
-      padding: 14px;
-      border: none;
-      border-radius: 8px;
-      background-color: #ff5c33;
-      color: #fff;
-      font-size: 1.1rem;
-      font-weight: 600;
-      cursor: pointer;
-      transition: background 0.2s ease;
-    }
-    button:hover {
-      background-color: #ff704d;
-    }
-    #msg {
-      margin-top: 1rem;
-      font-size: 0.95rem;
-      color: #9aa0a6;
-    }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <h2>Accept invitation</h2>
-    <p>Set your password to join the workspace.</p>
-    <form id="f">
-      <input type="password" id="pw" placeholder="New password">
-      <button type="submit">Save password</button>
-    </form>
-    <div id="msg"></div>
-  </div>
-  app.get('/api/invites/accept-page', async (req, res) => {
   try {
     const { token } = req.query || {};
     if (!token) return res.status(400).send('missing token');
@@ -245,100 +161,98 @@ app.get('/api/invites/accept-page', async (req, res) => {
 
     const invQ = await pool.query(`select status from invites where token=$1`, [token]);
     const inv = invQ.rows[0];
-    if (!inv)
-      return res.status(404).send('<h2 style="font-family:system-ui;color:#fff;background:#0f0f0f;padding:2rem">Invitation not found.</h2>');
-    if (inv.status === 'accepted')
-      return res.status(400).send('<h2 style="font-family:system-ui;color:#fff;background:#0f0f0f;padding:2rem">This invitation was already accepted.</h2>');
-
-    res.type('html').send(`<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Accept Invitation</title>
+    if (!inv) {
+      return res
+        .status(404)
+        .send('<h2 style="font-family:system-ui;color:#fff;background:#0f0f0f;padding:2rem">Invitation not found.</h2>');
+    }
+    if (inv.status === 'accepted') {
+      return res.type('html').send(`<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Invitation already accepted</title>
 <style>
-body {
-  margin: 0;
-  background: #0f0f0f;
-  color: #fff;
-  font-family: system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
-  display: flex;
-  justify-content: center;
-  align-items: center;
-  height: 100vh;
-}
-.card {
-  background: #1b1b1b;
-  padding: 40px 30px;
-  border-radius: 12px;
-  width: 90%;
-  max-width: 420px;
-  box-shadow: 0 0 30px rgba(0,0,0,0.4);
-  text-align: center;
-}
-h2 { margin: 0 0 14px; }
-p { color: #aaa; margin-bottom: 24px; font-size: 1rem; }
-input {
-  width: 100%;
-  padding: 14px;
-  border: none;
-  border-radius: 8px;
-  background: #2b2b2b;
-  color: #fff;
-  margin-bottom: 16px;
-  font-size: 1rem;
-}
-input:focus { outline: 2px solid #ff5c33; }
-button {
-  width: 100%;
-  padding: 14px;
-  background: #ff5c33;
-  border: none;
-  border-radius: 8px;
-  color: #fff;
-  font-size: 1rem;
-  font-weight: 600;
-  cursor: pointer;
-  transition: background .2s;
-}
-button:hover { background: #ff704d; }
-#msg { margin-top: 1rem; font-size: .9rem; color: #9aa0a6; }
-</style>
-</head>
+  body{margin:0;background:#0f0f0f;color:#fff;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+       min-height:100vh;display:flex;align-items:center;justify-content:center}
+  .card{background:#1b1b1b;padding:40px 30px;border-radius:12px;max-width:520px;width:90%;text-align:center;
+        box-shadow:0 0 30px rgba(0,0,0,.4)}
+  h2{margin:0 0 12px}
+  p{color:#aaa;margin:0 0 22px}
+  button{padding:12px 16px;border:0;border-radius:8px;background:#ff5c33;color:#fff;cursor:pointer;font-weight:600}
+  button:hover{background:#ff704d}
+</style></head>
 <body>
   <div class="card">
+    <h2>This invitation was already accepted</h2>
+    <p>Your access is ready. Download the app and log in with your email and the password you set.</p>
+    <button onclick="window.location.href=${JSON.stringify(DOWNLOAD_BASE_URL)}">Go to download</button>
+  </div>
+</body></html>`);
+    }
+
+    return res.type('html').send(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Accept Invitation</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { background:#0f0f0f; color:#fff; font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+           display:flex;align-items:center;justify-content:center; height:100vh; margin:0; }
+    .container { width:90%; max-width:440px; text-align:center; background:#1b1b1b; padding:40px 30px;
+                 border-radius:12px; box-shadow:0 0 30px rgba(0,0,0,0.4); }
+    h2 { font-size:2rem; margin-bottom:.75rem; }
+    p  { font-size:1.05rem; color:#bbb; margin-bottom:1.5rem; }
+    input[type="password"] { width:100%; padding:14px; border:none; border-radius:8px; background:#2b2b2b;
+                             color:#fff; font-size:1.05rem; margin-bottom:1rem; box-sizing:border-box; }
+    input[type="password"]:focus { outline:2px solid #ff5c33; }
+    button { width:100%; padding:14px; border:none; border-radius:8px; background:#ff5c33; color:#fff;
+             font-size:1.05rem; font-weight:700; cursor:pointer; }
+    button:hover { background:#ff704d; }
+    #msg { margin-top:.9rem; font-size:.95rem; color:#9aa0a6; min-height:1.2em; }
+  </style>
+</head>
+<body>
+  <div class="container">
     <h2>Accept invitation</h2>
     <p>Set your password to join the workspace.</p>
     <form id="f">
-      <input id="pw" type="password" placeholder="New password" />
+      <input type="password" id="pw" placeholder="New password" autocomplete="new-password">
       <button type="submit">Save password</button>
     </form>
     <div id="msg"></div>
   </div>
-<script>
-const t = ${JSON.stringify(String(token))};
-const form = document.getElementById('f');
-form.addEventListener('submit', async (e) => {
-  e.preventDefault();
-  const pw = document.getElementById('pw').value.trim();
-  const msg = document.getElementById('msg');
-  if (!pw) { msg.textContent = 'Please enter a password.'; return; }
-  msg.textContent = 'Saving password...';
-  const r = await fetch('/api/invites/accept', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({ token: t, password: pw })
-  });
-  const j = await r.json().catch(()=>null);
-  if (!j || !j.ok) {
-    msg.textContent = (j && j.error === 'invite_already_accepted')
-      ? 'This invite was already accepted.'
-      : 'Error saving password.';
-    return;
-  }
-  msg.textContent = 'Password saved. Redirecting...';
-  setTimeout(() => { window.location.href = ${JSON.stringify(DOWNLOAD_BASE_URL)}; }, 1000);
-});
-</script>
+  <script>
+    const t = ${JSON.stringify(String(token))};
+    const msg = document.getElementById('msg');
+    document.getElementById('f').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const pw = document.getElementById('pw').value.trim();
+      if (!pw) { msg.textContent = 'Please enter a password.'; return; }
+      msg.textContent = 'Saving password...';
+      try {
+        const r = await fetch('/api/invites/accept', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token: t, password: pw })
+        });
+        const j = await r.json().catch(() => null);
+        if (!j || !j.ok) {
+          const code = j && j.error;
+          msg.textContent =
+            code === 'invite_already_accepted' ? 'This invitation was already accepted. Please download the app and log in.' :
+            code === 'invalid_token'           ? 'Invalid or expired link.' :
+            code === 'invite_cancelled'        ? 'This invitation was cancelled.' :
+            'Error saving password.';
+          return;
+        }
+        msg.textContent = 'Password saved. Redirecting...';
+        setTimeout(() => { window.location.href = ${JSON.stringify(DOWNLOAD_BASE_URL)}; }, 900);
+      } catch {
+        msg.textContent = 'Network error. Please try again.';
+      }
+    });
+  </script>
 </body>
 </html>`);
   } catch (e) {
@@ -346,18 +260,8 @@ form.addEventListener('submit', async (e) => {
     res.status(500).send('server error');
   }
 });
-</body>
-</html>`);
-  } catch (e) {
-    console.error('GET /api/invites/accept-page', e);
-    res.status(500).send('server error');
-  }
-});
-/* ===== AUTH: Owner-Signup ===== */
-/** POST /api/auth/signup_owner
- * Body: { workspaceId, email, name, password }
- * Ergebnis: legt Owner-User an (falls nicht vorhanden) und gibt Session-Token zurück
- */
+
+/* ===== Accept API (JSON only; with proper already-accepted handling) ===== */
 app.post('/api/invites/accept', async (req, res) => {
   try {
     const { token, password, name } = req.body || {};
@@ -405,74 +309,6 @@ app.post('/api/invites/accept', async (req, res) => {
   } catch (e) {
     console.error('POST /api/invites/accept', e);
     res.status(500).json({ ok: false, error: 'server_error' });
-  }
-});
-
-/* ===== Auth: Login ===== */
-/** POST /api/auth/login  { workspaceId, email, password } */
-app.post('/api/auth/login', async (req, res) => {
-  try {
-    const { workspaceId, email, password } = req.body || {};
-    if (!workspaceId || !email || !password) {
-      return res.status(400).json({ ok:false, error:'missing_fields' });
-    }
-    const q = await pool.query(
-      `select * from users where workspace_id=$1 and email=$2`,
-      [String(workspaceId), String(email).toLowerCase()]
-    );
-    const u = q.rows[0];
-    if (!u) return res.status(401).json({ ok:false, error:'invalid_credentials' });
-
-    // NEW: disabled blocken
-    if (u.status !== 'active') {
-      return res.status(403).json({ ok:false, error:'user_disabled' });
-    }
-
-    const ok = await bcrypt.compare(password, u.password_hash);
-    if (!ok) return res.status(401).json({ ok:false, error:'invalid_credentials' });
-
-    const token = signToken({ workspaceId: u.workspace_id, email: u.email, role: u.role, iat: Date.now() });
-    res.json({ ok:true, token, email: u.email, role: u.role, workspaceId: u.workspace_id, name: u.name });
-  } catch (e) {
-    console.error('POST /api/auth/login', e);
-    res.status(500).json({ ok:false, error:'server_error' });
-  }
-});
-
-/* ===== Session: /me ===== */
-/** GET /api/me   (Authorization: Bearer <token>) */
-app.get('/api/me', async (req, res) => {
-  try {
-    const sess = authFromHeader(req);
-    if (!sess) return res.status(401).json({ ok:false, error:'no_or_bad_token' });
-
-    const meQ = await pool.query(
-      `select id,workspace_id,email,role,name,status,created_at
-         from users
-        where workspace_id=$1 and email=$2`,
-      [sess.workspaceId, String(sess.email).toLowerCase()]
-    );
-    const me = meQ.rows[0] || null;
-
-    const teamQ = await pool.query(
-      `select id,email,role,name,status,created_at
-         from users
-        where workspace_id=$1
-        order by (role='owner') desc, (role='admin') desc, email asc`,
-      [sess.workspaceId]
-    );
-
-    res.json({
-      ok: true,
-      user: me,
-      workspace: {
-        id: sess.workspaceId,
-        users: teamQ.rows
-      }
-    });
-  } catch (e) {
-    console.error('GET /api/me', e);
-    res.status(500).json({ ok:false, error:'server_error' });
   }
 });
 
@@ -588,205 +424,109 @@ app.post('/api/invites/:id/cancel', async (req, res) => {
   }
 });
 
-/* ===== Accept: Passwort setzen (API + Minimal-HTML) ===== */
-app.post('/api/invites/accept', async (req, res) => {
+/* ===== AUTH: Owner-Signup (restored) ===== */
+/** POST /api/auth/signup_owner
+ * Body: { workspaceId, email, name, password }
+ * Ergebnis: legt Owner-User an (falls nicht vorhanden) und gibt Session-Token zurück
+ */
+app.post('/api/auth/signup_owner', async (req, res) => {
   try {
-    const { token, password, name } = req.body || {};
-    if (!token || !password) return res.status(400).json({ ok:false, error:'missing_fields' });
+    const { workspaceId, email, name, password } = req.body || {};
+    if (!workspaceId || !email || !password) {
+      return res.status(400).json({ ok:false, error:'missing_fields' });
+    }
+    const wsid = String(workspaceId).trim();
+    const mail = String(email).toLowerCase().trim();
 
-    const payload = verifyToken(token);
-    if (!payload) return res.status(400).json({ ok:false, error:'invalid_token' });
+    const exists = await pool.query(
+      'select id from users where workspace_id=$1 and email=$2',
+      [wsid, mail]
+    );
+    if (exists.rowCount > 0) {
+      return res.status(409).json({ ok:false, error:'owner_exists' });
+    }
 
-    const invQ = await pool.query(`select * from invites where token=$1`, [token]);
-    const inv = invQ.rows[0];
-    if (!inv) return res.status(404).json({ ok:false, error:'invite_not_found' });
-    if (inv.status === 'cancelled') return res.status(400).json({ ok:false, error:'invite_cancelled' });
+    const hash = await bcrypt.hash(password, 10);
+    const ins = await pool.query(
+      `insert into users (workspace_id,email,role,password_hash,name,status)
+       values ($1,$2,'owner',$3,$4,'active')
+       returning id, workspace_id, email, role, name, status, created_at`,
+      [wsid, mail, hash, name || 'Owner']
+    );
 
-    const pwHash = await bcrypt.hash(password, 10);
-
-    // NEW: Accept setzt/reaktiviert status='active'
-    await pool.query(`
-      insert into users (workspace_id, email, role, password_hash, name, status)
-      values ($1,$2,$3,$4,$5,'active')
-      on conflict (workspace_id, email)
-      do update set role=excluded.role,
-                    password_hash=excluded.password_hash,
-                    name=excluded.name,
-                    status='active'
-    `, [
-      inv.workspace_id,
-      inv.invitee_email.toLowerCase(),
-      inv.role,
-      pwHash,
-      name || inv.invitee_email.split('@')[0]
-    ]);
-
-  if (inv.status === 'accepted') {
-  return res.type('html').send(`<!doctype html>
-<html lang="en"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Invitation already accepted</title>
-<style>
-  body{margin:0;background:#0f0f0f;color:#fff;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
-       min-height:100vh;display:flex;align-items:center;justify-content:center}
-  .card{background:#1b1b1b;padding:40px 30px;border-radius:12px;max-width:480px;width:90%;text-align:center;
-        box-shadow:0 0 30px rgba(0,0,0,.4)}
-  h2{margin:0 0 12px} p{color:#aaa;margin:0 0 22px}
-  button{padding:12px 16px;border:0;border-radius:8px;background:#ff5c33;color:#fff;cursor:pointer;font-weight:600}
-  button:hover{background:#ff704d}
-</style></head>
-<body>
-  <div class="card">
-    <h2>Invitation already accepted</h2>
-    <p>Your access is ready. Download the app and log in with your email and the password you set.</p>
-    <button onclick="window.location.href=${JSON.stringify(DOWNLOAD_BASE_URL)}">Go to download</button>
-  </div>
-</body></html>`);
-}
-
-    return res.json({ ok:true });
+    const token = signToken({ workspaceId: wsid, email: mail, role: 'owner', iat: Date.now() });
+    return res.json({ ok:true, token, user: ins.rows[0] });
   } catch (e) {
-    console.error('POST /api/invites/accept', e);
+    console.error('POST /api/auth/signup_owner', e);
     res.status(500).json({ ok:false, error:'server_error' });
   }
 });
 
-app.get('/api/invites/accept-page', async (req, res) => {
+/* ===== Auth: Login ===== */
+/** POST /api/auth/login  { workspaceId, email, password } */
+app.post('/api/auth/login', async (req, res) => {
   try {
-    const { token } = req.query || {};
-    if (!token) return res.status(400).send('missing token');
-
-    const payload = verifyToken(token);
-    if (!payload) return res.status(400).send('invalid token');
-
-    // Status prüfen, um doppelte Annahmen abzufangen
-    const invQ = await pool.query(`select status from invites where token=$1`, [token]);
-    const inv = invQ.rows[0];
-    if (!inv) {
-      return res
-        .status(404)
-        .send('<h2 style="font-family:system-ui;color:#fff;background:#0f0f0f;padding:2rem">Invitation not found.</h2>');
+    const { workspaceId, email, password } = req.body || {};
+    if (!workspaceId || !email || !password) {
+      return res.status(400).json({ ok:false, error:'missing_fields' });
     }
-    if (inv.status === 'accepted') {
-      return res.type('html').send(`<!doctype html>
-<html lang="en"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Invitation already accepted</title>
-<style>
-  body{margin:0;background:#0f0f0f;color:#fff;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
-       min-height:100vh;display:flex;align-items:center;justify-content:center}
-  .card{background:#1b1b1b;padding:40px 30px;border-radius:12px;max-width:520px;width:90%;text-align:center;
-        box-shadow:0 0 30px rgba(0,0,0,.4)}
-  h2{margin:0 0 12px}
-  p{color:#aaa;margin:0 0 22px}
-  button{padding:12px 16px;border:0;border-radius:8px;background:#ff5c33;color:#fff;cursor:pointer;font-weight:600}
-  button:hover{background:#ff704d}
-</style></head>
-<body>
-  <div class="card">
-    <h2>This invitation was already accepted</h2>
-    <p>Your access is ready. Download the app and log in with your email and the password you set.</p>
-    <button onclick="window.location.href=${JSON.stringify(DOWNLOAD_BASE_URL)}">Go to download</button>
-  </div>
-</body></html>`);
+    const q = await pool.query(
+      `select * from users where workspace_id=$1 and email=$2`,
+      [String(workspaceId), String(email).toLowerCase()]
+    );
+    const u = q.rows[0];
+    if (!u) return res.status(401).json({ ok:false, error:'invalid_credentials' });
+
+    // disabled blocken
+    if (u.status !== 'active') {
+      return res.status(403).json({ ok:false, error:'user_disabled' });
     }
 
-    // Formularseite
-    return res.type('html').send(`<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <title>Accept Invitation</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <style>
-    body {
-      background-color: #0f0f0f;
-      color: #fff;
-      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      height: 100vh;
-      margin: 0;
-    }
-    .container {
-      width: 90%;
-      max-width: 440px;
-      text-align: center;
-      background:#1b1b1b;
-      padding: 40px 30px;
-      border-radius: 12px;
-      box-shadow: 0 0 30px rgba(0,0,0,0.4);
-    }
-    h2 { font-size: 2rem; margin-bottom: 0.75rem; }
-    p  { font-size: 1.05rem; color: #bbb; margin-bottom: 1.5rem; }
-    input[type="password"] {
-      width: 100%; padding: 14px; border: none; border-radius: 8px;
-      background-color: #2b2b2b; color: #fff; font-size: 1.05rem; margin-bottom: 1rem; box-sizing: border-box;
-    }
-    input[type="password"]:focus { outline: 2px solid #ff5c33; }
-    button {
-      width: 100%; padding: 14px; border: none; border-radius: 8px;
-      background-color: #ff5c33; color: #fff; font-size: 1.05rem; font-weight: 700; cursor: pointer;
-    }
-    button:hover { background-color: #ff704d; }
-    #msg { margin-top: 0.9rem; font-size: 0.95rem; color: #9aa0a6; min-height: 1.2em; }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <h2>Accept invitation</h2>
-    <p>Set your password to join the workspace.</p>
-    <form id="f">
-      <input type="password" id="pw" placeholder="New password" autocomplete="new-password">
-      <button type="submit">Save password</button>
-    </form>
-    <div id="msg"></div>
-  </div>
-  <script>
-    const t = ${JSON.stringify(String(token))};
-    const msg = document.getElementById('msg');
-    document.getElementById('f').addEventListener('submit', async (e) => {
-      e.preventDefault();
-      const pw = document.getElementById('pw').value.trim();
-      if (!pw) { msg.textContent = 'Please enter a password.'; return; }
-      msg.textContent = 'Saving password...';
-      try {
-        const r = await fetch('/api/invites/accept', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ token: t, password: pw })
-        });
-        const j = await r.json().catch(() => null);
-        if (!j || !j.ok) {
-          const code = j && j.error;
-          msg.textContent =
-            code === 'invite_already_accepted' ? 'This invitation was already accepted. Please download the app and log in.' :
-            code === 'invalid_token'           ? 'Invalid or expired link.' :
-            code === 'invite_cancelled'        ? 'This invitation was cancelled.' :
-            'Error saving password.';
-          return;
-        }
-        msg.textContent = 'Password saved. Redirecting...';
-        setTimeout(() => { window.location.href = ${JSON.stringify(DOWNLOAD_BASE_URL)}; }, 900);
-      } catch {
-        msg.textContent = 'Network error. Please try again.';
-      }
-    });
-  </script>
-</body>
-</html>`);
+    const ok = await bcrypt.compare(password, u.password_hash);
+    if (!ok) return res.status(401).json({ ok:false, error:'invalid_credentials' });
+
+    const token = signToken({ workspaceId: u.workspace_id, email: u.email, role: u.role, iat: Date.now() });
+    res.json({ ok:true, token, email: u.email, role: u.role, workspaceId: u.workspace_id, name: u.name });
   } catch (e) {
-    console.error('GET /api/invites/accept-page', e);
-    res.status(500).send('server error');
+    console.error('POST /api/auth/login', e);
+    res.status(500).json({ ok:false, error:'server_error' });
   }
 });
-</script>
-</body>
-</html>`);
+
+/* ===== Session: /me ===== */
+/** GET /api/me   (Authorization: Bearer <token>) */
+app.get('/api/me', async (req, res) => {
+  try {
+    const sess = authFromHeader(req);
+    if (!sess) return res.status(401).json({ ok:false, error:'no_or_bad_token' });
+
+    const meQ = await pool.query(
+      `select id,workspace_id,email,role,name,status,created_at
+         from users
+        where workspace_id=$1 and email=$2`,
+      [sess.workspaceId, String(sess.email).toLowerCase()]
+    );
+    const me = meQ.rows[0] || null;
+
+    const teamQ = await pool.query(
+      `select id,email,role,name,status,created_at
+         from users
+        where workspace_id=$1
+        order by (role='owner') desc, (role='admin') desc, email asc`,
+      [sess.workspaceId]
+    );
+
+    res.json({
+      ok: true,
+      user: me,
+      workspace: {
+        id: sess.workspaceId,
+        users: teamQ.rows
+      }
+    });
   } catch (e) {
-    console.error('GET /api/invites/accept-page', e);
-    res.status(500).send('server error');
+    console.error('GET /api/me', e);
+    res.status(500).json({ ok:false, error:'server_error' });
   }
 });
 
